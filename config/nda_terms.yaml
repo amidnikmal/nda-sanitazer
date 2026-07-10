@@ -1,0 +1,21 @@
+# This dictionary is the primary NDA protection layer. Replace these synthetic
+# examples with real terms only after checking your employer's policy.
+project_names:
+  - SecretProjectX
+  - ProjectBlueLantern
+service_names:
+  - InternalServiceAlpha
+  - MercuryBuildBus
+internal_domains:
+  - internal.example.test
+  - corp.example.test
+db_schemas:
+  - private_customer_schema
+  - finance_reporting_v2
+people:
+  - Alex Example
+  - Maria Sample
+business_terms:
+  - Synthetic Acquisition Plan
+  - Example Revenue Formula
+

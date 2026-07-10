@@ -1,0 +1,17 @@
+[Unit]
+Description=Local llama.cpp server for NDA sanitizer
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/dima/nda-sanitizer
+ExecStart=/home/dima/nda-sanitizer/llama.cpp/build/bin/llama-server -m /home/dima/nda-sanitizer/models/Qwen3-8B-Q4_K_M.gguf -ngl 99 -c 8192 --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
+
