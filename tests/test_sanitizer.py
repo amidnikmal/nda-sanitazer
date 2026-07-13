@@ -37,6 +37,20 @@ def test_dictionary_term_does_not_leak(deterministic_sanitizer: Sanitizer) -> No
     assert "MercuryBuildBus" not in clean
 
 
+def test_overlapping_dictionary_terms_do_not_leak(deterministic_sanitizer: Sanitizer) -> None:
+    # "Alex Example" (people) and "Example Revenue Formula" (business_terms) share
+    # the word "Example". The overlapping region must be fully masked instead of
+    # leaving either term's exclusive tail in the clean text.
+    original = "Alex Example Revenue Formula"
+
+    clean, vault_id = deterministic_sanitizer.sanitize(original)
+
+    assert "Alex Example" not in clean
+    assert "Example Revenue Formula" not in clean
+    assert "Revenue Formula" not in clean
+    assert deterministic_sanitizer.restore(clean, vault_id) == original
+
+
 def test_secret_stops_before_sanitization(deterministic_sanitizer: Sanitizer) -> None:
     with pytest.raises(SecretDetectedError):
         deterministic_sanitizer.sanitize(

@@ -445,18 +445,37 @@ class Sanitizer:
     ) -> str:
         protected = [(match.start(), match.end()) for match in CANONICAL_PLACEHOLDER_RE.finditer(text)]
 
-        selected: list[tuple[int, int, str]] = []
-        for start, end, category in sorted(spans, key=lambda item: (item[0], -(item[1] - item[0]))):
+        candidates: list[tuple[int, int, str]] = []
+        for start, end, category in spans:
             if start < 0 or end > len(text) or start >= end:
                 continue
             if any(start < protected_end and end > protected_start for protected_start, protected_end in protected):
                 continue
-            if selected and start < selected[-1][1]:
-                continue
-            selected.append((start, end, category))
+            candidates.append((start, end, category))
+
+        # Sort by start, longest first at each start, then merge every overlapping
+        # run into a single region. Two dictionary/PII spans can partially overlap
+        # (for example "Alex Example" and "Example Revenue Formula" sharing the word
+        # "Example"). Dropping the later span would leave its exclusive tail
+        # ("Revenue Formula") in the clean text, so instead the whole overlapping
+        # region is masked as one placeholder. The category is taken from the
+        # longest contributing span. Adjacent, non-overlapping spans stay separate.
+        candidates.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+
+        merged: list[list[Any]] = []
+        for start, end, category in candidates:
+            if merged and start < merged[-1][1]:
+                group = merged[-1]
+                if end > group[1]:
+                    group[1] = end
+                if end - start > group[3]:
+                    group[2] = category
+                    group[3] = end - start
+            else:
+                merged.append([start, end, category, end - start])
 
         replacements: list[tuple[int, int, str]] = []
-        for start, end, category in selected:
+        for start, end, category, _ in merged:
             placeholder = builder.placeholder_for(category, text[start:end])
             replacements.append((start, end, placeholder))
 
