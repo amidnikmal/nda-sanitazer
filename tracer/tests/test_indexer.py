@@ -90,3 +90,42 @@ def test_reindex_after_change(tmp_path, fixture_repo):
     assert "brand_new_fn" in names
     assert db.counts()["symbols"] == before + 1
     db.close()
+
+
+def test_stale_schema_version_rebuilds(tmp_path):
+    from code_tracer.db import IndexDB, SCHEMA_VERSION
+
+    db_path = tmp_path / "index.db"
+    db = IndexDB(db_path)
+    db.conn.execute("UPDATE meta SET value='0' WHERE key='schema_version'")
+    db.conn.commit()
+    db.conn.close()
+
+    reopened = IndexDB(db_path)
+    row = reopened.conn.execute(
+        "SELECT value FROM meta WHERE key='schema_version'"
+    ).fetchone()
+    assert row["value"] == str(SCHEMA_VERSION)
+    reopened.conn.close()
+
+
+def test_pre_versioning_db_rebuilds(tmp_path):
+    import sqlite3
+
+    from code_tracer.db import IndexDB, SCHEMA_VERSION
+
+    db_path = tmp_path / "index.db"
+    conn = sqlite3.connect(db_path)
+    # старая база без meta: одноимённая FTS с несовместимой (contentless) схемой
+    conn.execute("CREATE VIRTUAL TABLE symbols_fts USING fts5(name, content='')")
+    conn.commit()
+    conn.close()
+
+    reopened = IndexDB(db_path)
+    row = reopened.conn.execute(
+        "SELECT value FROM meta WHERE key='schema_version'"
+    ).fetchone()
+    assert row["value"] == str(SCHEMA_VERSION)
+    # contentless-таблицы больше нет — DELETE не упадёт
+    reopened.conn.execute("DELETE FROM symbols_fts")
+    reopened.conn.close()

@@ -12,7 +12,7 @@ import struct
 from pathlib import Path
 from typing import Iterable, Sequence
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -91,11 +91,35 @@ def unpack_vector(blob: bytes | None) -> list[float]:
 class IndexDB:
     def __init__(self, db_path: str | Path):
         self.path = str(db_path)
+        self._connect()
+        if not self._schema_is_current():
+            # Older on-disk schema: индекс — производные данные, дешевле
+            # пересоздать, чем мигрировать.
+            self.conn.close()
+            for suffix in ("", "-wal", "-shm"):
+                Path(self.path + suffix).unlink(missing_ok=True)
+            self._connect()
+        self._init_schema()
+
+    def _connect(self) -> None:
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
-        self._init_schema()
+
+    def _schema_is_current(self) -> bool:
+        n_tables = self.conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='table'"
+        ).fetchone()[0]
+        if n_tables == 0:  # свежий пустой файл — схему создаст _init_schema
+            return True
+        try:
+            row = self.conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+        except sqlite3.OperationalError:  # таблицы есть, meta нет — до-versioning база
+            return False
+        return row is not None and row["value"] == str(SCHEMA_VERSION)
 
     def _init_schema(self) -> None:
         self.conn.executescript(_SCHEMA)
