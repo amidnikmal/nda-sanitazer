@@ -129,10 +129,11 @@ class VaultBuilder:
 
 
 class Sanitizer:
-    # Whitespace variants that may separate the tokens of a dictionary term in
-    # pasted text: regular spaces, tabs, newlines plus non-breaking (U+00A0) and
-    # narrow no-break (U+202F) spaces produced by editors and PDF exports.
-    _TERM_WHITESPACE = "[\\s\u00a0\u202f]+"
+    # Whitespace separating the tokens of a dictionary term in pasted text.
+    # Python's \s in Unicode mode already matches non-breaking (U+00A0) and narrow
+    # no-break (U+202F) spaces, as well as tabs and newlines, so listing them is
+    # unnecessary - a term still matches when the paste uses those separators.
+    _TERM_WHITESPACE = r"\s+"
 
     # Long inputs are split before the local LLM pass so entities near the end of
     # a big paste are still analyzed instead of silently dropped past the context.
@@ -461,10 +462,16 @@ class Sanitizer:
             )
             response.raise_for_status()
             content = response.json()["choices"][0]["message"]["content"]
-            parsed = self._parse_json_array(content)
+            parsed, salvaged = self._parse_json_array(content)
         except (requests.RequestException, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise SanitizerError("local LLM entity pass failed") from exc
 
+        if salvaged:
+            # The response was truncated (likely max_tokens); entities after the
+            # cut are lost. Log the count only, never the recovered values.
+            self.logger.warning(
+                "llm response truncated, salvaged %d candidate(s)", len(parsed)
+            )
         return self._clean_candidates(parsed, text)
 
     @staticmethod
@@ -503,7 +510,10 @@ class Sanitizer:
         return self._model_id
 
     @staticmethod
-    def _parse_json_array(content: str) -> list[Any]:
+    def _parse_json_array(content: str) -> tuple[list[Any], bool]:
+        """Return (elements, salvaged). ``salvaged`` is True when the normal JSON
+        parse failed and only the complete elements of a truncated or malformed
+        array could be recovered, so the caller can log the degraded pass."""
         content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
         if content.startswith("```"):
             content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content).strip()
@@ -515,7 +525,7 @@ class Sanitizer:
             try:
                 parsed = json.loads(content[start : end + 1])
                 if isinstance(parsed, list):
-                    return parsed
+                    return parsed, False
             except json.JSONDecodeError:
                 pass
         # Salvage a truncated array (max_tokens cut mid-response) by pulling every
@@ -526,7 +536,7 @@ class Sanitizer:
                 salvaged.append(json.loads(literal))
             except json.JSONDecodeError:
                 continue
-        return salvaged
+        return salvaged, True
 
     @staticmethod
     def _clip_to_gaps(

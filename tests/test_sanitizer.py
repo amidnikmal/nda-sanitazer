@@ -128,17 +128,65 @@ def test_span_is_clipped_around_existing_placeholder(
 
 
 @pytest.mark.parametrize(
-    "content,expected",
+    "content,expected,expected_salvaged",
     [
-        ('["Velmorix Quasar", "Internal', ["Velmorix Quasar"]),
-        ('["array[0] of X", "Bet', ["array[0] of X"]),
-        ('["A", "B"]', ["A", "B"]),
-        ("<think>x</think>```json\n[\"A\"]\n```", ["A"]),
+        ('["Velmorix Quasar", "Internal', ["Velmorix Quasar"], True),
+        ('["array[0] of X", "Bet', ["array[0] of X"], True),
+        ('["A", "B"]', ["A", "B"], False),
+        ("<think>x</think>```json\n[\"A\"]\n```", ["A"], False),
     ],
     ids=["truncated", "bracket-in-string", "normal", "fenced-with-think"],
 )
-def test_parse_json_array_salvages_truncated_output(content, expected) -> None:
-    assert Sanitizer._parse_json_array(content) == expected
+def test_parse_json_array_salvages_truncated_output(
+    content, expected, expected_salvaged
+) -> None:
+    parsed, salvaged = Sanitizer._parse_json_array(content)
+    assert parsed == expected
+    assert salvaged is expected_salvaged
+
+
+class _FakeResponse:
+    def __init__(self, content: str) -> None:
+        self._content = content
+
+    def raise_for_status(self) -> None:
+        pass
+
+    def json(self) -> dict:
+        return {"choices": [{"message": {"content": self._content}}]}
+
+
+def test_truncated_response_is_logged(
+    deterministic_sanitizer: Sanitizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import logging
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture()
+    deterministic_sanitizer.logger.addHandler(handler)
+    monkeypatch.setattr(deterministic_sanitizer, "_get_model_id", lambda: "model")
+    monkeypatch.setattr(
+        deterministic_sanitizer._session,
+        "post",
+        lambda *args, **kwargs: _FakeResponse('["Velmorix Quasar", "Internal'),
+    )
+    try:
+        candidates = deterministic_sanitizer._llm_candidates_for_chunk(
+            "Velmorix Quasar leaked"
+        )
+    finally:
+        deterministic_sanitizer.logger.removeHandler(handler)
+
+    assert candidates == ["Velmorix Quasar"]
+    warnings = [r.getMessage() for r in records if r.levelno == logging.WARNING]
+    assert any("truncated" in message and "salvaged 1" in message for message in warnings)
+    # The recovered sensitive value must never appear in the log.
+    assert all("Velmorix" not in message for message in warnings)
 
 
 def test_clean_candidates_strips_and_recovers_case() -> None:
