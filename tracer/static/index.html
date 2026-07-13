@@ -1,0 +1,233 @@
+<!-- code-tracer UI: single self-contained page, no CDN, all inline. -->
+<meta charset="utf-8">
+<title>code-tracer</title>
+<style>
+  :root { --bg:#1e1e2e; --fg:#e0e0e8; --mut:#9aa0b0; --acc:#7aa2f7;
+          --panel:#282a3a; --border:#3a3d52; --ok:#9ece6a; --warn:#e0af68; --bad:#f7768e; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  header { display:flex; align-items:center; gap:16px; padding:10px 16px;
+           border-bottom:1px solid var(--border); background:var(--panel); }
+  header b { color:var(--acc); }
+  nav button { background:none; border:none; color:var(--mut); cursor:pointer;
+               font:inherit; padding:6px 10px; border-radius:6px; }
+  nav button.active { color:var(--fg); background:var(--bg); }
+  main { padding:16px; max-width:1100px; margin:0 auto; }
+  .screen { display:none; } .screen.active { display:block; }
+  input[type=text], textarea { width:100%; padding:8px; background:var(--bg);
+    color:var(--fg); border:1px solid var(--border); border-radius:6px; font:inherit; }
+  textarea { min-height:160px; font-family:ui-monospace,monospace; }
+  button.act { background:var(--acc); color:#0b0b16; border:none; padding:8px 14px;
+    border-radius:6px; cursor:pointer; font:inherit; font-weight:600; }
+  button.sec { background:var(--panel); color:var(--fg); border:1px solid var(--border);
+    padding:6px 10px; border-radius:6px; cursor:pointer; font:inherit; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:10px 0; }
+  table { border-collapse:collapse; width:100%; margin-top:12px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border);
+    vertical-align:top; }
+  th { color:var(--mut); font-weight:600; }
+  .loc { color:var(--acc); cursor:pointer; font-family:ui-monospace,monospace; }
+  .loc:hover { text-decoration:underline; }
+  .mut { color:var(--mut); }
+  .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+  details { margin:2px 0 2px 14px; border-left:1px solid var(--border); padding-left:10px; }
+  summary { cursor:pointer; }
+  .pill { font-size:11px; padding:1px 6px; border-radius:10px; border:1px solid var(--border); }
+  .filterm { margin:8px 0; }
+  #toast { position:fixed; bottom:16px; right:16px; background:var(--panel);
+    border:1px solid var(--border); padding:10px 14px; border-radius:8px; display:none; }
+  .box { background:var(--panel); border:1px solid var(--border); border-radius:8px;
+    padding:12px; margin:10px 0; }
+  code { font-family:ui-monospace,monospace; }
+</style>
+
+<header>
+  <b>code-tracer</b>
+  <nav>
+    <button data-s="where" class="active">Where</button>
+    <button data-s="trace">Trace</button>
+    <button data-s="stack">Stack</button>
+    <button data-s="index">Index</button>
+  </nav>
+  <span class="mut" id="root" style="margin-left:auto"></span>
+</header>
+
+<main>
+  <!-- WHERE -->
+  <section class="screen active" id="s-where">
+    <div class="row">
+      <input type="text" id="where-q" placeholder="Where is authentication handled?" style="flex:1">
+      <label class="mut"><input type="checkbox" id="where-fast"> fast (no LLM)</label>
+      <button class="act" id="where-go">Search</button>
+    </div>
+    <div id="where-out"></div>
+  </section>
+
+  <!-- TRACE -->
+  <section class="screen" id="s-trace">
+    <div class="row">
+      <input type="text" id="trace-target" placeholder="function name or file.py:42" style="flex:1">
+      <select id="trace-dir" class="sec"><option value="down">callees ↓</option><option value="up">callers ↑</option></select>
+      <label class="mut">depth <input type="number" id="trace-depth" value="3" min="1" max="6" style="width:48px"></label>
+      <button class="act" id="trace-go">Trace</button>
+    </div>
+    <div class="row">
+      <input type="text" id="trace-filter" class="filterm" placeholder="filter by file substring" style="flex:1">
+      <button class="sec" id="trace-copy">Copy file list</button>
+      <label class="mut"><input type="checkbox" id="san-toggle"> Sanitize on copy (for cloud)</label>
+    </div>
+    <div id="trace-out"></div>
+  </section>
+
+  <!-- STACK -->
+  <section class="screen" id="s-stack">
+    <textarea id="stack-in" placeholder="Paste a python / PHP / Go panic / Node.js stack trace"></textarea>
+    <div class="row"><button class="act" id="stack-go">Parse & bind</button></div>
+    <div id="stack-out"></div>
+  </section>
+
+  <!-- INDEX -->
+  <section class="screen" id="s-index">
+    <div class="row">
+      <input type="text" id="index-dir" placeholder="project directory" style="flex:1">
+      <button class="act" id="index-go">Index</button>
+    </div>
+    <div class="box" id="index-status">not started</div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const TOKEN = new URLSearchParams(location.search).get("token") || "";
+const H = { "Content-Type":"application/json", "X-Tracer-Token": TOKEN };
+let SANITIZE = false;
+
+function api(path, body){
+  return fetch(path + "?token=" + encodeURIComponent(TOKEN),
+    {method:"POST", headers:H, body:JSON.stringify(body||{})})
+    .then(r => r.json());
+}
+function get(path){
+  return fetch(path + "?token=" + encodeURIComponent(TOKEN), {headers:H}).then(r=>r.json());
+}
+function toast(msg){ const t=document.getElementById("toast");
+  t.textContent=msg; t.style.display="block"; setTimeout(()=>t.style.display="none",2500); }
+
+// nav
+document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("nav button").forEach(x=>x.classList.remove("active"));
+  document.querySelectorAll(".screen").forEach(x=>x.classList.remove("active"));
+  b.classList.add("active");
+  document.getElementById("s-"+b.dataset.s).classList.add("active");
+});
+
+// config / heartbeat
+get("/api/config").then(c=>{
+  document.getElementById("root").textContent = c.root;
+  document.getElementById("index-dir").value = c.root;
+}).catch(()=>{});
+setInterval(()=>{ api("/api/heartbeat",{}).catch(()=>{}); }, 5000);
+api("/api/heartbeat",{});
+
+function openLoc(path,line){ api("/api/open",{path:path,line:line}); }
+
+// WHERE
+document.getElementById("where-go").onclick = ()=>{
+  const q=document.getElementById("where-q").value;
+  const fast=document.getElementById("where-fast").checked;
+  const out=document.getElementById("where-out"); out.textContent="…";
+  api("/api/where",{q:q, fast:fast}).then(r=>{
+    if(!r.hits || !r.hits.length){ out.textContent="no matches"; return; }
+    let h="<table><tr><th>file:line</th><th>symbol</th><th>why</th></tr>";
+    r.hits.forEach(x=>{ h+=`<tr><td class="loc" onclick="openLoc('${esc(x.path)}',${x.line})">${esc(x.path)}:${x.line}</td>`+
+      `<td>${esc(x.qualname)}</td><td class="mut">${esc(x.why)}</td></tr>`; });
+    out.innerHTML=h+"</table>";
+  });
+};
+document.getElementById("where-q").addEventListener("keydown",e=>{if(e.key==="Enter")document.getElementById("where-go").click();});
+
+// TRACE
+let TRACE_FILES=[];
+document.getElementById("trace-go").onclick = ()=>{
+  const target=document.getElementById("trace-target").value;
+  const dir=document.getElementById("trace-dir").value;
+  const depth=parseInt(document.getElementById("trace-depth").value)||3;
+  const out=document.getElementById("trace-out"); out.textContent="…";
+  api("/api/trace",{target:target, direction:dir, depth:depth}).then(r=>{
+    if(r.error){ out.textContent=r.error; return; }
+    TRACE_FILES=[];
+    out.innerHTML = renderNode(r.tree, true);
+    applyFilter();
+  });
+};
+function renderNode(n, isRoot){
+  if(TRACE_FILES.indexOf(n.path)<0) TRACE_FILES.push(n.path);
+  const conf = n.confidence||"high";
+  const cc = conf==="high"?"ok":(conf==="medium"?"warn":"bad");
+  const loc = `<span class="loc" onclick="openLoc('${esc(n.path)}',${n.line})">${esc(n.path)}:${n.line}</span>`;
+  const ex = n.explain?` <span class="mut">— ${esc(n.explain)}</span>`:"";
+  const head = `<span class="pill ${cc}">${conf}</span> <b>${esc(n.qualname)}</b> ${loc}${ex}`;
+  if(!n.children || !n.children.length) return `<div class="frow" data-f="${esc(n.path)}" style="margin-left:14px">${head}</div>`;
+  let inner = n.children.map(c=>renderNode(c,false)).join("");
+  return `<details open class="frow" data-f="${esc(n.path)}"><summary>${head}</summary>${inner}</details>`;
+}
+document.getElementById("trace-filter").addEventListener("input",applyFilter);
+function applyFilter(){
+  const term=document.getElementById("trace-filter").value.toLowerCase();
+  document.querySelectorAll("#trace-out .frow").forEach(el=>{
+    const f=(el.dataset.f||"").toLowerCase();
+    el.style.display = (!term || f.indexOf(term)>=0) ? "" : "none";
+  });
+}
+document.getElementById("san-toggle").onchange=e=>{ SANITIZE=e.target.checked; };
+document.getElementById("trace-copy").onclick = ()=>{
+  const list=[...new Set(TRACE_FILES)].join("\n");
+  copyOut(list);
+};
+
+// generic copy honoring sanitize toggle
+function copyOut(text){
+  if(!SANITIZE){ navigator.clipboard.writeText(text).then(()=>toast("copied (raw)")); return; }
+  api("/api/copy",{text:text, sanitize:true}).then(r=>{
+    if(r.blocked){ toast("BLOCKED: "+r.reason); return; }
+    navigator.clipboard.writeText(r.text).then(()=>toast("copied sanitized"+(r.vault_id?(" · vault "+r.vault_id):"")));
+  });
+}
+
+// STACK
+document.getElementById("stack-go").onclick = ()=>{
+  const text=document.getElementById("stack-in").value;
+  const out=document.getElementById("stack-out"); out.textContent="…";
+  api("/api/stack",{text:text}).then(r=>{
+    let h=`<p class="mut">format: <b>${esc(r.format)}</b> · ${r.frames.length} frames</p>`;
+    h+="<table><tr><th>#</th><th>frame</th><th>in-index</th></tr>";
+    r.frames.forEach((f,i)=>{ const cls=f.in_index?"ok":"bad";
+      const loc = f.in_index?`<span class="loc" onclick="openLoc('${esc(f.file)}',${f.line})">${esc(f.file)}:${f.line}</span>`:`${esc(f.file||"?")}:${f.line||""}`;
+      h+=`<tr><td>${i}</td><td>${loc} ${esc(f.func||"")}</td><td class="${cls}">${f.in_index?"yes":"no"}</td></tr>`; });
+    out.innerHTML=h+"</table>";
+  });
+};
+
+// INDEX
+document.getElementById("index-go").onclick = ()=>{
+  const dir=document.getElementById("index-dir").value;
+  api("/api/index",{dir:dir}).then(r=>{
+    if(r.error){ document.getElementById("index-status").textContent=r.error; return; }
+    pollIndex();
+  });
+};
+function pollIndex(){
+  get("/api/index/status").then(s=>{
+    const el=document.getElementById("index-status");
+    if(s.running){ el.textContent=`indexing… ${s.done}/${s.total}`; setTimeout(pollIndex,500); }
+    else if(s.stats){ const t=s.stats;
+      if(t.error){ el.textContent="error: "+t.error; return; }
+      el.innerHTML=`<b class="ok">done</b> — files ${t.files_scanned} · symbols ${t.symbols} · edges ${t.edges} · chunks ${t.chunks} · ${(t.seconds||0).toFixed(2)}s`;
+    } else { el.textContent="not started"; }
+  });
+}
+
+function esc(s){ return (s==null?"":String(s)).replace(/[&<>'"]/g,c=>(
+  {"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;","\"":"&quot;"}[c])); }
+</script>
