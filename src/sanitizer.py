@@ -100,7 +100,14 @@ class VaultBuilder:
         self.replacements: dict[str, str] = {}
         self._by_value: dict[tuple[str, str], str] = {}
         self._counters: dict[str, int] = {}
-        self._reserved_text = reserved_text
+        # Reserve the canonical form of every placeholder-lookalike already in the
+        # source. restore() canonicalizes tolerant spellings such as
+        # "[ project _ 1 ]", so if we were to hand that same canonical id to a
+        # sanitized value the round trip would rewrite the pre-existing lookalike.
+        self._reserved: set[str] = {
+            f"[{match.group(1).upper()}_{int(match.group(2))}]"
+            for match in PLACEHOLDER_RE.finditer(reserved_text)
+        }
 
     def placeholder_for(self, category: str, value: str) -> str:
         key = (category, value)
@@ -112,7 +119,7 @@ class VaultBuilder:
         while True:
             counter += 1
             placeholder = f"[{category}_{counter}]"
-            if placeholder not in self._reserved_text and placeholder not in self.replacements:
+            if placeholder not in self._reserved and placeholder not in self.replacements:
                 break
 
         self._counters[category] = counter
@@ -122,6 +129,16 @@ class VaultBuilder:
 
 
 class Sanitizer:
+    # Whitespace variants that may separate the tokens of a dictionary term in
+    # pasted text: regular spaces, tabs, newlines plus non-breaking (U+00A0) and
+    # narrow no-break (U+202F) spaces produced by editors and PDF exports.
+    _TERM_WHITESPACE = "[\\s\u00a0\u202f]+"
+
+    # Long inputs are split before the local LLM pass so entities near the end of
+    # a big paste are still analyzed instead of silently dropped past the context.
+    _LLM_CHUNK_CHARS = 4000
+    _LLM_CHUNK_OVERLAP = 200
+
     def __init__(
         self,
         root: str | Path | None = None,
@@ -129,6 +146,9 @@ class Sanitizer:
         require_llm: bool = True,
         enable_pii: bool = True,
         llm_base_url: str | None = None,
+        case_insensitive: bool = False,
+        pii_score_threshold: float = 0.0,
+        mask_unmapped_pii: bool = False,
     ) -> None:
         self.root = Path(root) if root else Path(__file__).resolve().parents[1]
         self.config_path = self.root / "config" / "nda_terms.yaml"
@@ -136,6 +156,9 @@ class Sanitizer:
         self.log_dir = self.root / "logs"
         self.require_llm = require_llm
         self.enable_pii = enable_pii
+        self.case_insensitive = case_insensitive
+        self.pii_score_threshold = pii_score_threshold
+        self.mask_unmapped_pii = mask_unmapped_pii
         self.llm_base_url = (llm_base_url or os.getenv(
             "NDA_SANITIZER_LLM_URL", "http://127.0.0.1:8080"
         )).rstrip("/")
@@ -295,15 +318,30 @@ class Sanitizer:
             if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
                 raise SanitizerError(f"dictionary category {yaml_category} must be a string list")
             for value in values:
+                value = value.strip()
                 if value:
                     terms.append((value, placeholder_category))
         terms.sort(key=lambda item: len(item[0]), reverse=True)
         return terms
 
+    def _term_regex(self, term: str) -> re.Pattern[str] | None:
+        # Match the term regardless of which whitespace separates its tokens, so a
+        # dictionary entry still fires when the pasted text uses non-breaking or
+        # doubled spaces. Case folding is opt-in to preserve the documented
+        # case-sensitive contract by default.
+        tokens = [re.escape(token) for token in term.split()]
+        if not tokens:
+            return None
+        flags = re.IGNORECASE if self.case_insensitive else 0
+        return re.compile(self._TERM_WHITESPACE.join(tokens), flags)
+
     def _replace_dictionary(self, text: str, builder: VaultBuilder) -> str:
         spans: list[tuple[int, int, str]] = []
         for term, category in self._load_terms():
-            spans.extend((m.start(), m.end(), category) for m in re.finditer(re.escape(term), text))
+            regex = self._term_regex(term)
+            if regex is None:
+                continue
+            spans.extend((m.start(), m.end(), category) for m in regex.finditer(text))
         return self._replace_spans(text, spans, builder)
 
     def _get_analyzer(self) -> Any:
@@ -335,11 +373,19 @@ class Sanitizer:
         spans: list[tuple[int, int, str]] = []
         for language in ("en", "ru"):
             try:
-                results = analyzer.analyze(text=text, language=language)
+                results = analyzer.analyze(
+                    text=text,
+                    language=language,
+                    score_threshold=self.pii_score_threshold,
+                )
             except Exception as exc:  # Presidio can wrap model-specific failures.
                 raise SanitizerError(f"Presidio analysis failed for language {language}") from exc
             for result in results:
                 category = PII_CATEGORIES.get(result.entity_type)
+                if category is None and self.mask_unmapped_pii:
+                    # Optionally mask entity types not in the whitelist (e.g. SSN,
+                    # passport) instead of letting them pass through unredacted.
+                    category = "PII"
                 if category:
                     spans.append((result.start, result.end, category))
         return self._replace_spans(text, spans, builder)
@@ -354,7 +400,28 @@ class Sanitizer:
             )
         return self._replace_spans(text, spans, builder)
 
+    def _chunk_text(self, text: str) -> list[str]:
+        if len(text) <= self._LLM_CHUNK_CHARS:
+            return [text]
+        chunks: list[str] = []
+        step = self._LLM_CHUNK_CHARS - self._LLM_CHUNK_OVERLAP
+        for start in range(0, len(text), step):
+            chunks.append(text[start : start + self._LLM_CHUNK_CHARS])
+            if start + self._LLM_CHUNK_CHARS >= len(text):
+                break
+        return chunks
+
     def _llm_candidates(self, text: str) -> list[str]:
+        # Analyze long inputs chunk by chunk so entities in the tail are not lost
+        # past the model context, then union the candidates across chunks.
+        candidates: list[str] = []
+        for chunk in self._chunk_text(text):
+            for candidate in self._llm_candidates_for_chunk(chunk):
+                if candidate not in candidates:
+                    candidates.append(candidate)
+        return candidates
+
+    def _llm_candidates_for_chunk(self, text: str) -> list[str]:
         model_id = self._get_model_id()
         schema = {
             "type": "array",
@@ -376,7 +443,7 @@ class Sanitizer:
                 {"role": "user", "content": text},
             ],
             "temperature": 0,
-            "max_tokens": 256,
+            "max_tokens": 1024,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -398,18 +465,30 @@ class Sanitizer:
         except (requests.RequestException, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise SanitizerError("local LLM entity pass failed") from exc
 
+        return self._clean_candidates(parsed, text)
+
+    @staticmethod
+    def _clean_candidates(parsed: Iterable[Any], text: str) -> list[str]:
         candidates: list[str] = []
+        lowered = text.lower()
         for value in parsed:
             if not isinstance(value, str):
                 continue
-            if value != value.strip() or not 2 <= len(value) <= 160:
+            value = value.strip()
+            if not 2 <= len(value) <= 160 or "\n" in value:
                 continue
-            if "\n" in value or CANONICAL_PLACEHOLDER_RE.search(value):
+            if CANONICAL_PLACEHOLDER_RE.search(value) or not any(c.isalnum() for c in value):
                 continue
-            if value not in text or not any(character.isalnum() for character in value):
-                continue
-            if value not in candidates:
-                candidates.append(value)
+            actual = value
+            if value not in text:
+                # The model often echoes an entity in a different case; recover the
+                # exact-case substring so the later regex replacement still matches.
+                index = lowered.find(value.lower())
+                if index < 0:
+                    continue
+                actual = text[index : index + len(value)]
+            if actual not in candidates:
+                candidates.append(actual)
         return candidates
 
     def _get_model_id(self) -> str:
@@ -429,13 +508,43 @@ class Sanitizer:
         if content.startswith("```"):
             content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content).strip()
         start = content.find("[")
-        end = content.rfind("]")
-        if start < 0 or end < start:
+        if start < 0:
             raise ValueError("LLM response does not contain a JSON array")
-        parsed = json.loads(content[start : end + 1])
-        if not isinstance(parsed, list):
-            raise ValueError("LLM response is not a JSON array")
-        return parsed
+        end = content.rfind("]")
+        if end > start:
+            try:
+                parsed = json.loads(content[start : end + 1])
+                if isinstance(parsed, list):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+        # Salvage a truncated array (max_tokens cut mid-response) by pulling every
+        # complete JSON string literal; brackets inside a literal are ignored.
+        salvaged: list[Any] = []
+        for literal in re.findall(r'"(?:[^"\\]|\\.)*"', content[start:]):
+            try:
+                salvaged.append(json.loads(literal))
+            except json.JSONDecodeError:
+                continue
+        return salvaged
+
+    @staticmethod
+    def _clip_to_gaps(
+        start: int, end: int, protected: list[tuple[int, int]]
+    ) -> list[tuple[int, int]]:
+        segments = [(start, end)]
+        for protected_start, protected_end in protected:
+            next_segments: list[tuple[int, int]] = []
+            for segment_start, segment_end in segments:
+                if protected_end <= segment_start or protected_start >= segment_end:
+                    next_segments.append((segment_start, segment_end))
+                    continue
+                if segment_start < protected_start:
+                    next_segments.append((segment_start, protected_start))
+                if protected_end < segment_end:
+                    next_segments.append((protected_end, segment_end))
+            segments = next_segments
+        return segments
 
     @staticmethod
     def _replace_spans(
@@ -443,15 +552,25 @@ class Sanitizer:
         spans: Iterable[tuple[int, int, str]],
         builder: VaultBuilder,
     ) -> str:
-        protected = [(match.start(), match.end()) for match in CANONICAL_PLACEHOLDER_RE.finditer(text)]
+        protected = sorted(
+            (match.start(), match.end()) for match in CANONICAL_PLACEHOLDER_RE.finditer(text)
+        )
 
         candidates: list[tuple[int, int, str]] = []
         for start, end, category in spans:
             if start < 0 or end > len(text) or start >= end:
                 continue
-            if any(start < protected_end and end > protected_start for protected_start, protected_end in protected):
-                continue
-            candidates.append((start, end, category))
+            # Subtract already-placed placeholders instead of dropping the whole
+            # span: a later layer may flag "John [PROJECT_1]" as one entity, and
+            # dropping it would leak the "John " part that does not touch the
+            # placeholder. Each surviving fragment is trimmed of edge whitespace.
+            for sub_start, sub_end in Sanitizer._clip_to_gaps(start, end, protected):
+                while sub_start < sub_end and text[sub_start].isspace():
+                    sub_start += 1
+                while sub_end > sub_start and text[sub_end - 1].isspace():
+                    sub_end -= 1
+                if sub_start < sub_end:
+                    candidates.append((sub_start, sub_end, category))
 
         # Sort by start, longest first at each start, then merge every overlapping
         # run into a single region. Two dictionary/PII spans can partially overlap

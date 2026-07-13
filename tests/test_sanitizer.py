@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import requests
 
-from src.sanitizer import Sanitizer, SecretDetectedError
+from src.sanitizer import Sanitizer, SecretDetectedError, VaultBuilder
 
 
 def test_round_trip_is_byte_exact(deterministic_sanitizer: Sanitizer) -> None:
@@ -49,6 +49,119 @@ def test_overlapping_dictionary_terms_do_not_leak(deterministic_sanitizer: Sanit
     assert "Example Revenue Formula" not in clean
     assert "Revenue Formula" not in clean
     assert deterministic_sanitizer.restore(clean, vault_id) == original
+
+
+@pytest.mark.parametrize(
+    "separator",
+    [" ", " ", "  ", "\t", "\n"],
+    ids=["nbsp", "narrow-nbsp", "double-space", "tab", "newline"],
+)
+def test_dictionary_matches_whitespace_variants(
+    deterministic_sanitizer: Sanitizer, separator: str
+) -> None:
+    # Pasted text often separates the tokens of a term with a non-breaking or
+    # doubled space; the exact-string match used to miss those and leak the term.
+    original = f"Contact Alex{separator}Example soon"
+
+    clean, vault_id = deterministic_sanitizer.sanitize(original)
+
+    assert "Alex" not in clean
+    assert "Example" not in clean
+    assert deterministic_sanitizer.restore(clean, vault_id) == original
+
+
+def test_case_insensitive_matching_is_opt_in(project_root: Path) -> None:
+    case_sensitive = Sanitizer(root=project_root, require_llm=False, enable_pii=False)
+    clean, _ = case_sensitive.sanitize("secretprojectx")
+    assert clean == "secretprojectx"  # documented default: exact case
+
+    folded = Sanitizer(
+        root=project_root, require_llm=False, enable_pii=False, case_insensitive=True
+    )
+    clean, vault_id = folded.sanitize("secretprojectx")
+    assert "secretprojectx" not in clean
+    assert folded.restore(clean, vault_id) == "secretprojectx"
+
+
+def test_dictionary_term_whitespace_is_stripped(tmp_path: Path) -> None:
+    root = tmp_path / "nda-sanitizer"
+    (root / "config").mkdir(parents=True)
+    (root / "vaults").mkdir()
+    (root / "logs").mkdir()
+    (root / "config" / "nda_terms.yaml").write_text(
+        'project_names:\n  - "SecretProjectX "\n', encoding="utf-8"
+    )
+    sanitizer = Sanitizer(root=root, require_llm=False, enable_pii=False)
+
+    clean, vault_id = sanitizer.sanitize("Use SecretProjectX.")
+
+    assert "SecretProjectX" not in clean
+    assert sanitizer.restore(clean, vault_id) == "Use SecretProjectX."
+
+
+def test_placeholder_lookalike_in_source_round_trips(
+    deterministic_sanitizer: Sanitizer,
+) -> None:
+    # restore() canonicalizes tolerant spellings, so a lookalike already present
+    # in the source must not collide with an id we assign to a sanitized value.
+    original = "step [ project _ 1 ] of SecretProjectX"
+
+    clean, vault_id = deterministic_sanitizer.sanitize(original)
+
+    assert deterministic_sanitizer.restore(clean, vault_id) == original
+
+
+def test_span_is_clipped_around_existing_placeholder(
+    deterministic_sanitizer: Sanitizer,
+) -> None:
+    text = "John SecretProjectX"
+    builder = VaultBuilder(text)
+    after_dictionary = deterministic_sanitizer._replace_dictionary(text, builder)
+
+    # A later layer flags the whole "John [PROJECT_1]" region as one entity.
+    result = deterministic_sanitizer._replace_spans(
+        after_dictionary, [(0, len(after_dictionary), "PERSON")], builder
+    )
+
+    assert "John" not in result
+    assert "[PROJECT_1]" in result
+
+
+@pytest.mark.parametrize(
+    "content,expected",
+    [
+        ('["Velmorix Quasar", "Internal', ["Velmorix Quasar"]),
+        ('["array[0] of X", "Bet', ["array[0] of X"]),
+        ('["A", "B"]', ["A", "B"]),
+        ("<think>x</think>```json\n[\"A\"]\n```", ["A"]),
+    ],
+    ids=["truncated", "bracket-in-string", "normal", "fenced-with-think"],
+)
+def test_parse_json_array_salvages_truncated_output(content, expected) -> None:
+    assert Sanitizer._parse_json_array(content) == expected
+
+
+def test_clean_candidates_strips_and_recovers_case() -> None:
+    text = "Velmorix Quasar must stay secret"
+
+    assert Sanitizer._clean_candidates(["Velmorix Quasar "], text) == ["Velmorix Quasar"]
+    assert Sanitizer._clean_candidates(["velmorix quasar"], text) == ["Velmorix Quasar"]
+    assert Sanitizer._clean_candidates(["[PROJECT_1]"], text) == []
+
+
+def test_chunk_text_covers_entire_input(deterministic_sanitizer: Sanitizer) -> None:
+    assert deterministic_sanitizer._chunk_text("short") == ["short"]
+
+    big = "x" * (deterministic_sanitizer._LLM_CHUNK_CHARS * 3)
+    chunks = deterministic_sanitizer._chunk_text(big)
+    step = (
+        deterministic_sanitizer._LLM_CHUNK_CHARS
+        - deterministic_sanitizer._LLM_CHUNK_OVERLAP
+    )
+    covered: set[int] = set()
+    for index, chunk in enumerate(chunks):
+        covered.update(range(index * step, index * step + len(chunk)))
+    assert covered.issuperset(range(len(big)))
 
 
 def test_secret_stops_before_sanitization(deterministic_sanitizer: Sanitizer) -> None:
